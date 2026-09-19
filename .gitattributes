@@ -1,0 +1,17 @@
+# 统一换行：仓库内一律 LF；在 Linux 容器中执行的脚本强制 LF 检出，避免 CRLF 导致 bash 报错。
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+
+# 二进制与模型文件
+*.gguf binary
+*.onnx binary
+*.pdf binary
+*.xlsx binary
+*.docx binary

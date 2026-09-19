@@ -1,0 +1,100 @@
+name: wheelhouse
+
+# 按目标平台（Python 3.13，manylinux <= 2.28，x86_64）下载项目锁定依赖的二进制轮子，
+# 校验标签，然后在 debian:10 断网容器中用独立 Python 离线安装并逐个导入。
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/wheelhouse.yml"
+      - ".github/docker/**"
+      - "scripts/check_wheel_tags.py"
+      - "scripts/import_check.py"
+      - "scripts/import_skip.txt"
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/wheelhouse.yml"
+      - ".github/docker/**"
+      - "scripts/check_wheel_tags.py"
+      - "scripts/import_check.py"
+      - "scripts/import_skip.txt"
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.13"
+  TARGET_GLIBC: "2.28"
+  TORCH_CPU_INDEX: https://download.pytorch.org/whl/cpu
+
+jobs:
+  wheelhouse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: 导出锁定依赖
+        run: |
+          uv export --frozen --no-hashes --all-groups -o requirements.txt
+          echo "::group::requirements.txt"; cat requirements.txt; echo "::endgroup::"
+
+      - name: 下载目标平台轮子
+        run: |
+          python -m pip install -q packaging
+          mkdir -p wheelhouse
+          if grep -qE '^[A-Za-z0-9]' requirements.txt; then
+            pip download -r requirements.txt -d wheelhouse \
+              --only-binary=:all: \
+              --python-version "$PYTHON_VERSION" --implementation cp \
+              --abi cp313 --abi abi3 --abi none \
+              --platform manylinux_2_28_x86_64 \
+              --platform manylinux_2_17_x86_64 \
+              --platform manylinux2014_x86_64 \
+              --extra-index-url "$TORCH_CPU_INDEX"
+          else
+            echo "锁定依赖为空，跳过下载"
+          fi
+          du -sh wheelhouse
+
+      - name: 校验轮子标签
+        run: python scripts/check_wheel_tags.py wheelhouse --max-glibc "$TARGET_GLIBC"
+
+      - name: 准备可移植运行时（uv 与独立 Python）
+        run: |
+          mkdir -p .ci/uv .ci/python
+          curl -LsSf https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C .ci/uv --strip-components=1
+          UV_PYTHON_INSTALL_DIR="$PWD/.ci/python" .ci/uv/uv python install "$PYTHON_VERSION"
+
+      - name: 构建 debian10 验证镜像
+        run: docker build -t dataprism-debian10 -f .github/docker/debian10.Dockerfile .github/docker
+
+      - name: 在 debian:10 断网容器中离线安装并导入
+        run: |
+          docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" \
+            -e UV_PYTHON_INSTALL_DIR="$PWD/.ci/python" \
+            dataprism-debian10 bash -euo pipefail -c '
+              .ci/uv/uv venv --python "'"$PYTHON_VERSION"'" .ci/venv
+              if grep -qE "^[A-Za-z0-9]" requirements.txt; then
+                .ci/uv/uv pip install --python .ci/venv/bin/python \
+                  --offline --no-index --find-links wheelhouse -r requirements.txt
+              fi
+              .ci/venv/bin/python scripts/import_check.py'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheelhouse-linux-x86_64-py313
+          path: |
+            wheelhouse/
+            requirements.txt
+          retention-days: 14

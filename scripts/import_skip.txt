@@ -1,0 +1,6 @@
+# import_check.py 跳过的顶层模块名，每行一个。
+# 只放那些不是真正的库入口、或导入时会启动副作用的名字。
+tests
+test
+docs
+examples

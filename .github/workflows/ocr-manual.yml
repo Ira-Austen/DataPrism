@@ -1,0 +1,87 @@
+name: ocr-manual
+
+# 手动触发：在独立的 Python 3.12 环境中安装 MinerU，下载 pipeline 后端模型，
+# 在 debian:10 断网容器中用 CPU 解析一份栅格化的扫描件样例，记录每页耗时。
+# 模型体积大、CPU 耗时长，不进入常规 CI。命令与参数基于撰写时的认知，首次运行时按 MinerU 当前文档校正。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mineru_spec:
+        description: "pip 安装规格"
+        default: "mineru[core]"
+        type: string
+
+env:
+  PYTHON_VERSION: "3.12"
+  TORCH_CPU_INDEX: https://download.pytorch.org/whl/cpu
+
+jobs:
+  ocr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备可移植运行时并安装 MinerU（联网）
+        run: |
+          mkdir -p .ci/uv .ci/python .ci/home
+          curl -LsSf https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C .ci/uv --strip-components=1
+          export UV_PYTHON_INSTALL_DIR="$PWD/.ci/python"
+          .ci/uv/uv python install "$PYTHON_VERSION"
+          .ci/uv/uv venv --python "$PYTHON_VERSION" .ci/venv-ocr
+          .ci/uv/uv pip install --python .ci/venv-ocr/bin/python \
+            --extra-index-url "$TORCH_CPU_INDEX" --index-strategy unsafe-best-match \
+            "${{ inputs.mineru_spec }}" reportlab pypdfium2 pillow
+          du -sh .ci/venv-ocr
+
+      - uses: actions/cache@v4
+        with:
+          path: .ci/home
+          key: mineru-models-${{ inputs.mineru_spec }}-v1
+
+      - name: 下载 MinerU pipeline 模型（联网，缓存未命中时）
+        env:
+          HOME: ${{ github.workspace }}/.ci/home
+        run: |
+          if [ ! -f .ci/home/.mineru-models-done ]; then
+            .ci/venv-ocr/bin/mineru-models-download -s huggingface -m pipeline
+            touch .ci/home/.mineru-models-done
+          fi
+          ls -la .ci/home
+          cat .ci/home/mineru.json 2>/dev/null || echo "未找到 mineru.json，请核对模型目录配置方式"
+
+      - name: 生成扫描件样例（文本 PDF 栅格化为纯图像 PDF）
+        run: |
+          .ci/venv-ocr/bin/python scripts/make_fixture_pdf.py tests/fixtures/generated/sample.pdf
+          .ci/venv-ocr/bin/python - <<'EOF'
+          import pypdfium2 as pdfium
+          pdf = pdfium.PdfDocument("tests/fixtures/generated/sample.pdf")
+          images = [page.render(scale=200 / 72).to_pil().convert("RGB") for page in pdf]
+          images[0].save("tests/fixtures/generated/scanned.pdf", save_all=True, append_images=images[1:])
+          print("已生成 scanned.pdf，页数", len(images))
+          EOF
+
+      - name: 构建 debian10 验证镜像
+        run: docker build -t dataprism-debian10 -f .github/docker/debian10.Dockerfile .github/docker
+
+      - name: 在 debian:10 断网容器中用 CPU 解析
+        run: |
+          docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" \
+            -e HOME="$PWD/.ci/home" -e UV_PYTHON_INSTALL_DIR="$PWD/.ci/python" \
+            -e OMP_NUM_THREADS="$(nproc)" \
+            dataprism-debian10 bash -euo pipefail -c '
+              mkdir -p .ci/results
+              start=$(date +%s)
+              .ci/venv-ocr/bin/mineru -p tests/fixtures/generated/scanned.pdf -o .ci/results/mineru -b pipeline -d cpu
+              end=$(date +%s)
+              echo "耗时 $((end - start)) 秒" | tee .ci/results/mineru-timing.txt
+              find .ci/results/mineru -type f | head -50'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ocr-results
+          path: .ci/results/
+          retention-days: 30

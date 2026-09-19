@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# CI 与本地验证产物
+.ci/
+wheelhouse/
+requirements.txt
+tests/fixtures/generated/
+
+# 模型与二进制只保留注册表与说明
+models/*
+!models/models.toml
+bin/*
+!bin/README.md
+
+# 本地会话数据
+data/

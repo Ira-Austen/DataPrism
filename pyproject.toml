@@ -1,0 +1,13 @@
+[project]
+name = "dataprism"
+version = "0.1.0"
+description = "离线 CPU 环境下的多格式文档字段发现与数据清洗工具"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = []

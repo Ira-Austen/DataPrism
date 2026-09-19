@@ -1,0 +1,9 @@
+# 冒烟验证专用依赖，独立于项目主依赖；项目依赖定型后迁入 pyproject 的依赖组。
+# torch 通过 --extra-index-url https://download.pytorch.org/whl/cpu 取 CPU 版。
+onnxruntime
+tokenizers
+numpy
+docling
+nicegui
+reportlab
+packaging

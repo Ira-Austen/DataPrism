@@ -1,0 +1,99 @@
+name: offline-smoke
+
+# 联网阶段下载模型与依赖，随后在 debian:10 断网容器中验证：
+# llama-server 结构化抽取、bge 嵌入、Docling 离线解析、NiceGUI 无外部请求。
+# 耗时数字来自托管 runner，只作相对参考，不代表海光或兆芯机器。
+
+on:
+  workflow_dispatch:
+    inputs:
+      gguf_url:
+        description: "GGUF 模型下载地址，留空用仓库变量 SMOKE_GGUF_URL 或默认值"
+        default: ""
+        type: string
+      llama_cpp_ref:
+        description: "llama.cpp 的 tag、分支或提交号"
+        default: "master"
+        type: string
+  pull_request:
+    paths:
+      - ".github/workflows/offline-smoke.yml"
+      - "scripts/smoke_*.py"
+      - "scripts/smoke-requirements.txt"
+      - "scripts/ci_*.sh"
+      - "scripts/check_no_external_requests.py"
+      - "scripts/make_fixture_pdf.py"
+
+env:
+  PYTHON_VERSION: "3.13"
+  TORCH_CPU_INDEX: https://download.pytorch.org/whl/cpu
+  BGE_REPO: Xenova/bge-small-zh-v1.5
+  # 默认模型地址未经核实，首次运行前请在仓库变量 SMOKE_GGUF_URL 中确认
+  GGUF_URL: ${{ inputs.gguf_url || vars.SMOKE_GGUF_URL || 'https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf' }}
+
+jobs:
+  build-llama-server:
+    uses: ./.github/workflows/build-llama-server.yml
+    with:
+      llama_cpp_ref: ${{ inputs.llama_cpp_ref || 'master' }}
+
+  smoke:
+    needs: build-llama-server
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: llama-server-linux-x86_64
+          path: bin/linux-x86_64/
+      - run: chmod +x bin/linux-x86_64/llama-server
+
+      - name: 准备可移植运行时并安装冒烟依赖（联网）
+        run: |
+          mkdir -p .ci/uv .ci/python
+          curl -LsSf https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C .ci/uv --strip-components=1
+          export UV_PYTHON_INSTALL_DIR="$PWD/.ci/python"
+          .ci/uv/uv python install "$PYTHON_VERSION"
+          .ci/uv/uv venv --python "$PYTHON_VERSION" .ci/venv
+          .ci/uv/uv pip install --python .ci/venv/bin/python \
+            --extra-index-url "$TORCH_CPU_INDEX" --index-strategy unsafe-best-match \
+            -r scripts/smoke-requirements.txt
+          du -sh .ci/venv
+
+      - name: 生成模型清单（用于缓存键）
+        run: |
+          mkdir -p .ci/models
+          printf 'gguf=%s\nbge=%s\n' "$GGUF_URL" "$BGE_REPO" > .ci/models/KEY
+          .ci/venv/bin/python -c 'import importlib.metadata as m; print("docling=" + m.version("docling"))' >> .ci/models/KEY
+          cat .ci/models/KEY
+
+      - uses: actions/cache@v4
+        with:
+          path: .ci/models
+          key: smoke-models-${{ hashFiles('.ci/models/KEY') }}
+
+      - name: 下载模型（联网，缓存未命中时）
+        run: bash scripts/ci_download_models.sh .ci/models .ci/venv/bin/python
+
+      - name: 生成夹具 PDF
+        run: .ci/venv/bin/python scripts/make_fixture_pdf.py tests/fixtures/generated/sample.pdf
+
+      - name: 构建 debian10 验证镜像
+        run: docker build -t dataprism-debian10 -f .github/docker/debian10.Dockerfile .github/docker
+
+      - name: 在 debian:10 断网容器中执行冒烟检查
+        run: |
+          docker run --rm --network none -v "$PWD:$PWD" -w "$PWD" \
+            -e UV_PYTHON_INSTALL_DIR="$PWD/.ci/python" \
+            -e OMP_NUM_THREADS="$(nproc)" \
+            dataprism-debian10 bash scripts/ci_offline_smoke.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-results
+          path: .ci/results/
+          retention-days: 30
